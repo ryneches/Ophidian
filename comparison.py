@@ -1,0 +1,213 @@
+#!/usr/bin/env python
+# vim: set ts=4 sw=4 et:
+"""
+Build a table of data for plotting a comparison graph.
+"""
+
+from pylab import *
+from Numeric import *
+from scipy import *
+from optparse import OptionParser
+from ACUBE import *
+from ACUBE2 import *
+
+parser = OptionParser()
+parser.add_option("-d", "--directory", dest="directory",
+                  help="directory where CUBE data can be found", metavar="DIR")
+parser.add_option("-n", "--surfaces", dest="n",
+                  help="number of flux surfaces to use in the analytic solution", metavar="N")
+
+(options, args) = parser.parse_args()
+
+picklefile = options.directory+'/output.pickle'
+n = int(options.n)
+
+# import CUBE data
+print "reading CUBE flux data...."
+a = io.array_import.read_array( options.directory+'/rerun/bin/flux.txt' )
+NX = len(a)
+NY = len(a[0])
+
+print "    [NX, NY]:", NX, NY
+
+print "    building masking matrix from CUBE solution..."
+mask = array(a)
+for i in range(len(mask)) :
+    for j in range(len(mask[0])) :
+        if a[i][j] >= 0.0 :
+            mask[i][j] = 1
+        else :
+            mask[i][j] = 0
+            
+print "reading CUBE radial functions..."
+T = data.CUBEdata()
+T.read( options.directory+'/rerun/bin/results.txt' )
+
+Rmin, Rmax = T.plasma_range()
+Rmin_i, Rmax_i = T.plasma_range_index()
+axis = T.plasma_axis()
+
+print "    [Rmin, Rmax] =", [Rmin, Rmax]
+print "    axis =", axis
+T.slice( Rmin, axis )
+print "    sliced at Rmin =", Rmin, "axis =", axis
+
+print "fitting CUBE data..."
+
+#### pressure fit
+V = [ 10, 10, 10, 10 ]
+
+def pressure( V, R ) :
+    p0, p1, p2, p3 = V
+    return p0 + p1 * e**( p2 * R - p3 )
+
+def p_residuals( V, y, x ) :
+    return y - pressure( V, x )
+
+fit = optimize.leastsq(p_residuals, V, args=(T.p, T.R), full_output=1)
+if fit[2] == 1 :
+    print "    pressure profile fitted to exponential of form p0 + p1 * e**( p2 * R - p3 )"
+    print "    [p0, p1, p2, p3] =", fit[0]
+    W = fit[0]
+else :
+    print "    Error: Pressure profile fit failed."
+    print fit[3]
+    
+#### flux fit
+#O = [ 1, 1, 1, 1 ]
+O = [ 0.1, 0.1, 0.1, 0.1 ]
+
+def psi ( O, R ) :
+    a, b, c, d = O
+    return a + b * e**( c * R - d )
+
+def psi_residuals( O, y, x ) :
+    #a, b, c, d = O
+    return y - psi( O, x )
+
+fit = optimize.leastsq(psi_residuals, O, args=(T.psi, T.R), full_output=1)
+if fit[2] == 1 :
+    print "    flux profile fitted to exponential of form a + b * e**( c * R - d )"
+    print "    [a, b, c, d] =", fit[0]
+    P = fit[0]
+else :
+    print "    Error: Flux profile fit failed."
+    print fit[3]
+
+#### [d psi]/[d R] fit
+N = [ 1, 1, 1, 1 ]
+
+def dpsi( N, R ) :
+    a_psi, b_psi, c_psi, d_psi = N
+    return b_psi * c_psi * e**( c_psi * R - d_psi )
+
+def dpsi_residuals( N, y, x ) :
+    return y - dpsi( N, x )
+
+s = blob.spline()
+s.build( T.R, T.psi, natural = 'yes' )
+T.dpsi = []
+for i in T.R :
+    T.dpsi.append( s.get_dZ_for_R(i) )
+
+fit = optimize.leastsq(dpsi_residuals, N, args=(T.dpsi, T.R), full_output=1 )
+if fit[2] == 1 :
+    print "    [d psi]/[d R] profile fitted to exponential of form b_psi * c_psi * e**( c_psi * R - d_psi )"
+    print "    [b_psi, c_psi, d_psi] =", fit[0]
+    M = fit[0]
+else :
+    print "    Error: [d psi]/[d R] profile fit failed."
+    print fit[3]
+
+
+# build analytic solution
+print "building analytic solution..."
+t = exp_pressure.tokamak()
+t.Rmin = Rmin
+t.Rmax = Rmax
+t.p0 = W[0]
+t.p1 = W[1]
+t.p2 = W[2]
+t.p3 = W[3]
+t.a_psi = P[0]
+t.b_psi = P[1]
+t.c_psi = P[2]
+t.d_psi = P[3]
+t.BtRmin = T.Btoro[Rmin_i]
+
+print "    finding magnetic axis..."
+t.axis = t.axis_label = t.find_axis_label()
+print "    axis found at", t.axis
+
+print "    interpolating to grid...."
+b = array(t.contour( n, NX, NY ))
+c = array(a)
+
+for i in range(NX) :
+    for j in range(NY) :
+        if b[i][j] == 0.0 :
+            c[i][j] = 0.0
+
+d = abs(c - b)
+print "    scanning for numerical clutter..."
+junk = []
+for i in range(NY) :
+    if b[i][0] != 0.0 :
+        junk.append(i)
+
+print "    clutter found on rows", junk
+
+for i in junk :
+    for j in range(NX) :
+        b[i][j] = 0.0
+        d[i][j] = 0.0
+
+# geometric mismatch
+mask_1 = array(b)
+for i in range(len(b)) :
+    for j in range(len(b[0])) :
+        if b[i][j] > 0.0 :
+            mask_1[i][j] = 1
+        else :
+            mask_1[i][j] = 0
+
+max_flux = []
+max_error = []
+for i in a :
+    max_flux.append(max(i))
+max_flux = max(max_flux)
+for i in d :
+    max_error.append(max(i))
+max_error = max(max_error)
+
+print "    Maximum Flux:", max_flux
+print "    Maximum error:", max_error
+
+print "building contour plots..."
+
+subplot(221)
+#bone()
+title('CUBE result')
+contourf(mask*a, n, origin='lower', extent=(3.9,6.1,-1.1,1.1))
+#colorbar()
+contour(mask*a, n, origin='lower', extent=(3.9,6.1,-1.1,1.1), colors='black')
+
+subplot(222)
+#bone()
+title('analytic result')
+contourf(b, n, origin='lower', extent=(3.9,6.1,-1.1,1.1))
+contour(b, n, origin='lower', extent=(3.9,6.1,-1.1,1.1), colors='black')
+#colorbar()
+
+subplot(223)
+#jet()
+title('normalized max error')
+contourf(d/max_flux, origin='lower', extent=(3.9,6.1,-1.1,1.1))
+colorbar()
+#contour(d, origin='lower', extent=(3.9,6.1,-1.1,1.1), colors='black')
+
+subplot(224)
+title('geometric mismatch')
+contourf(mask - mask_1, origin='lower', extent=(3.9,6.1,-1.1,1.1))
+
+show()
